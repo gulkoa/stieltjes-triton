@@ -1,7 +1,7 @@
 [project]
 name = "stieltjes-attention"
 version = "0.1.0"
-description = "Flash attention with Stieltjes-transform normalisation (Triton forward, PyTorch backward)."
+description = "Flash attention with Stieltjes-transform normalisation. Triton forward kernel + PyTorch backward + nanoGPT training pipeline used in the paper."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -10,7 +10,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Pipeline extras: needed to run nanogpt/train.py, eval/analyze, and figures.
+nanogpt = [
+    "numpy",
+]
+figures = [
+    "matplotlib",
+    "pandas",
+    "numpy",
+]
 test = ["pytest>=8.0"]
+dev = [
+    "stieltjes-attention[nanogpt,figures,test]",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -18,3 +30,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["stieltjes_attention"]
+
+[tool.setuptools.packages.find]
+include = ["nanogpt*"]
+exclude = ["tests*", "benchmarks*", "figures*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

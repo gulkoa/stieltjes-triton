@@ -1,0 +1,54 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cpu:
+    name: CPU (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install CPU torch + project (no deps)
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch wheel keeps the install fast and avoids CUDA bits we
+          # cannot use on a hosted runner. Triton is a no-op without CUDA but
+          # imports cleanly so the module-level import in stieltjes_attention
+          # still succeeds.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest
+          pip install -e . --no-deps
+
+      - name: Show environment
+        run: |
+          python -c "import sys, torch, triton; \
+            print('python', sys.version.split()[0]); \
+            print('torch ', torch.__version__, 'cuda:', torch.cuda.is_available()); \
+            print('triton', triton.__version__)"
+
+      - name: Module import smoke
+        run: |
+          python -c "import stieltjes_attention; print(stieltjes_attention.__all__)"
+          python -c "from nanogpt.model import GPT, GPTConfig; print('nanogpt OK')"
+
+      - name: pytest collection
+        run: pytest tests/ --collect-only -q
+
+      - name: pytest run (GPU tests auto-skip on CPU runner)
+        run: pytest tests/ -v --tb=short

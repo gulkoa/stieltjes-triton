@@ -21,11 +21,15 @@ Kernel for Algebraic Normalization* (Gulko & Kumar, 2026).
 7. [API reference](#api-reference)
 8. [Numerical considerations](#numerical-considerations)
 9. [Backward pass: why PyTorch and not Triton](#backward-pass-why-pytorch-and-not-triton)
-10. [Test harness](#test-harness)
-11. [Reported performance](#reported-performance)
-12. [Troubleshooting](#troubleshooting)
-13. [Limitations](#limitations)
-14. [Citation](#citation)
+10. [Training pipeline (nanoGPT)](#training-pipeline-nanogpt)
+11. [Benchmarks](#benchmarks)
+12. [Figures](#figures)
+13. [Test harness](#test-harness)
+14. [Continuous integration](#continuous-integration)
+15. [Reported performance](#reported-performance)
+16. [Troubleshooting](#troubleshooting)
+17. [Limitations](#limitations)
+18. [Citation](#citation)
 
 ---
 
@@ -53,12 +57,18 @@ Newton solve, one for the `P @ V` accumulation) and never materialises the
 
 ## What is in this repository
 
+This is the **complete training and evaluation pipeline** that produced the
+paper. It contains:
+
 | Path | Purpose |
 | --- | --- |
-| `stieltjes_attention.py` | Single-file implementation: PyTorch reference, Triton forward kernel, and `torch.autograd.Function` wrapper. |
-| `tests/test_stieltjes.py` | Forward and backward correctness tests against the PyTorch reference. Pytest-friendly and stand-alone runnable. |
-| `pyproject.toml` | Install metadata. Module is published as `stieltjes_attention`. |
-| `README.md` | This file. |
+| `stieltjes_attention.py` | Triton forward kernel + PyTorch reference + autograd Function. |
+| `nanogpt/` | Training pipeline: CLRS data, GPT-2-style backbone with swappable softmax/Stieltjes attention, training loop, q-curriculum trainer, checkpoint evaluation, attention analysis. |
+| `benchmarks/` | Throughput benchmarks (`bench_triton_vs_ref.py` produces the paper's headline speedup CSV; `bench_stieltjes.py` benchmarks the standalone NR vs binary-search kernels). |
+| `figures/` | Plotting scripts that produced every paper figure from CSV/JSON outputs. |
+| `tests/` | Pytest harness — converted from the original `scripts/test_all.sh` and split by responsibility (`test_imports`, `test_data`, `test_model`, `test_kernel`). Same checks the paper's authors ran before every commit. |
+| `.github/workflows/tests.yml` | CPU CI on every push/PR. |
+| `pyproject.toml` | Install metadata + extras (`nanogpt`, `figures`, `test`, `dev`). |
 
 The autograd wrapper uses the **Triton kernel for the forward pass** (fast,
 low memory) and a **PyTorch backward** that reruns the autograd-friendly
@@ -103,11 +113,14 @@ flow that matches your environment.
 git clone https://github.com/gulkoa/stieltjes-triton.git
 cd stieltjes-triton
 
-# editable install — picks up edits without reinstalling
+# kernel only
 pip install -e .
 
-# with the test extras (adds pytest)
+# kernel + test harness (pytest)
 pip install -e ".[test]"
+
+# everything: kernel + nanogpt training + figures + tests
+pip install -e ".[dev]"
 ```
 
 ### 2. Fresh virtual environment
@@ -356,45 +369,208 @@ correction is left for future work.
 
 ---
 
+## Training pipeline (nanoGPT)
+
+The `nanogpt/` package is the training pipeline used for every accuracy
+experiment in the paper. It is a stripped-down GPT-2-style backbone with
+swappable softmax / Stieltjes attention, byte-level CLRS-task data
+generation, an output-only accuracy metric, and a curriculum trainer
+that anneals the Stieltjes order `q` over epochs.
+
+Install the pipeline extras alongside the kernel:
+
+```bash
+pip install -e ".[nanogpt]"   # adds numpy
+# or, for everything (training + figures + tests):
+pip install -e ".[dev]"
+```
+
+### Layout
+
+| Module | Responsibility |
+| --- | --- |
+| `nanogpt/data.py` | CLRS task generators (`sorting`, `binary_search`, `bfs`, `max`, `needle`) and the `CLRSDataset` PyTorch wrapper. Vocabulary is `0..255` byte values + `SEPARATOR=256` + `PAD=257`. |
+| `nanogpt/model.py` | `GPTConfig` and `GPT`. Causal self-attention block dispatches to either softmax or Stieltjes (Triton kernel or PyTorch reference). `pos_enc="learned"` (default) or `"none"` (NoPE). |
+| `nanogpt/train.py` | Single-config training loop. Logs per-epoch CSV; designed for a compute node (no plotting). |
+| `nanogpt/train_curriculum.py` | Same loop but mutates `stieltjes_q` per a `q@epoch` schedule string. |
+| `nanogpt/eval_accuracy.py` | Re-evaluates a saved checkpoint under three accuracy metrics (`output_only`, `all_positions`, `input_echo`) and emits JSON. |
+| `nanogpt/analyze.py` | Extracts per-head attention patterns, entropy and concentration statistics from a checkpoint; saves CSV and `.pt` tensors for downstream figure scripts. |
+
+### Train softmax baseline
+
+```bash
+python nanogpt/train.py \
+    --task binary_search \
+    --attn softmax \
+    --seq-len 128 \
+    --epochs 30 \
+    --num-samples 20000 \
+    --out results/binary_search_softmax/
+```
+
+### Train Stieltjes (PyTorch reference path — what the paper uses)
+
+```bash
+python nanogpt/train.py \
+    --task binary_search \
+    --attn stieltjes \
+    --q 4.0 \
+    --stieltjes-num-iter 3 \
+    --seq-len 128 \
+    --epochs 30 \
+    --num-samples 20000 \
+    --out results/binary_search_stieltjes_q4/
+```
+
+Add `--stieltjes-use-triton` to route training through the Triton forward
+(plus PyTorch backward via the autograd Function). Numerically equivalent
+on the paper's tasks but slightly faster at long context.
+
+### q-curriculum
+
+Anneal q over epochs. Schedule is a comma-separated list of `q@start_epoch`
+(1-indexed); each value is held until the next entry kicks in.
+
+```bash
+python nanogpt/train_curriculum.py \
+    --task binary_search --attn stieltjes \
+    --q-schedule "1@1,2@11,4@21,8@31,16@41" \
+    --epochs 50 \
+    --out results/bsearch_curriculum_q1to16/
+```
+
+### Evaluate a checkpoint
+
+```bash
+python nanogpt/eval_accuracy.py \
+    --checkpoint results/binary_search_stieltjes_q4/model.pt \
+    --task binary_search --attn stieltjes --q 4.0 \
+    --seq-len 128 --val-samples 5000 --seed 42
+```
+
+Writes `accuracy_fixed.json` next to the checkpoint with the three
+accuracy variants and a sanity-check histogram of output-start positions.
+
+### Extract attention patterns
+
+```bash
+python nanogpt/analyze.py \
+    --checkpoint results/binary_search_stieltjes_q4/model.pt \
+    --task binary_search --attn stieltjes --q 4.0 \
+    --out results/binary_search_stieltjes_q4/analysis/
+```
+
+Each script accepts `--help` for the full argument list.
+
+---
+
+## Benchmarks
+
+Both benchmarks require a CUDA GPU.
+
+### Triton vs PyTorch reference (paper headline)
+
+```bash
+python benchmarks/bench_triton_vs_ref.py
+```
+
+Sweeps the shape grid from Section 3.2 of the paper and writes
+`bench_triton_vs_ref_<host>_<gpu>.csv`. Forward speedup, backward
+speedup, and per-shape times are recorded. The `figures/`
+throughput plots consume this CSV.
+
+### Standalone Stieltjes kernel (NR vs binary search)
+
+```bash
+python benchmarks/bench_stieltjes.py
+```
+
+Benchmarks four implementations of the row-wise Stieltjes
+normalisation (Triton NR, PyTorch NR, Triton binary search, PyTorch
+binary search) plus a softmax baseline across context lengths from 256
+to 131k. Prints a table and saves a PNG.
+
+---
+
+## Figures
+
+Every figure in the paper is reproduced by a script in `figures/`:
+
+| Script | Paper figure |
+| --- | --- |
+| `fig_throughput_a100_vs_h100.py` | Per-shape forward speedup, A100 vs H100 (headline). |
+| `fig_throughput_and_memory.py` | Throughput + memory grid on a single hardware. |
+| `fig_training_curves.py` | Selected `metrics.csv` curves for the main needle/binary-search runs. |
+| `fig_all_training_curves.py` | One plot per task — debugging view of every run under `results/`. |
+| `fig_q_curve_bsearch.py` | Accuracy vs Stieltjes order `q` on `binary_search`. |
+| `fig_entropy_curriculum_boundary.py` | Attention-entropy phase transition under the q-curriculum. |
+| `fig_velickovic_attention_maps.py` | Velickovic-style attention heatmaps across context lengths. |
+| `fig_velickovic_entropy_vs_seq.py` | Entropy vs sequence length per attention type. |
+
+Install the figure extras:
+
+```bash
+pip install -e ".[figures]"
+```
+
+Each script reads from `results/` (relative to the repo root) and writes
+PDFs to `figures/out/`. Run them after producing the corresponding
+`metrics.csv` / benchmark CSV / analysis output via the pipeline above:
+
+```bash
+python figures/fig_throughput_a100_vs_h100.py
+python figures/fig_q_curve_bsearch.py
+# ...
+```
+
+---
+
 ## Test harness
 
-The test file lives at `tests/test_stieltjes.py`. It can be invoked
-either through pytest (recommended for CI) or as a stand-alone script
-(useful when pytest is not installed).
+The test harness mirrors the pre-commit suite the paper's authors ran
+before every code change. It is split by responsibility across four
+files in `tests/` so failures localise quickly:
 
-All tests automatically skip on machines without CUDA.
+| File | Coverage | GPU? |
+| --- | --- | --- |
+| `tests/test_imports.py` | Every public module imports without crashing. | CPU |
+| `tests/test_data.py` | All five CLRS task generators produce algorithmically correct outputs; the accuracy-metric pipeline is internally consistent; `model.ignore_index` matches `data.PAD`. | CPU |
+| `tests/test_model.py` | Forward + backward of the GPT backbone with both attention types; NoPE accepts long sequences; param count of the default config. | CPU |
+| `tests/test_kernel.py` | Triton forward parity vs the fp32 reference and Triton backward parity vs `torch.autograd.grad` through the reference. Auto-skips on CPU runners. | GPU |
+
+Together: 20 CPU tests + 21 GPU tests.
 
 ### Run everything
 
 ```bash
-pytest tests/test_stieltjes.py
+pytest tests/
 ```
 
 Verbose output (one line per parametrised configuration):
 
 ```bash
-pytest tests/test_stieltjes.py -v
+pytest tests/ -v
 ```
 
 Compact failure tracebacks:
 
 ```bash
-pytest tests/test_stieltjes.py -v --tb=short
+pytest tests/ -v --tb=short
 ```
 
 ### List the test grid without running
 
 ```bash
-pytest tests/test_stieltjes.py --collect-only -q
+pytest tests/ --collect-only -q
 ```
 
 You will see entries such as
 
 ```
-tests/test_stieltjes.py::test_forward_matches_reference[1-1-64-64-False-1.0]
-tests/test_stieltjes.py::test_forward_matches_reference[1-1-64-64-True-1.0]
+tests/::test_forward_matches_reference[1-1-64-64-False-1.0]
+tests/::test_forward_matches_reference[1-1-64-64-True-1.0]
 ...
-tests/test_stieltjes.py::test_backward_matches_reference[1-1-1024-64-False-1.0]
+tests/::test_backward_matches_reference[1-1-1024-64-False-1.0]
 ```
 
 The bracketed suffix is `[B-H-N-D-causal-q]`.
@@ -402,39 +578,41 @@ The bracketed suffix is `[B-H-N-D-causal-q]`.
 ### Run only the forward tests
 
 ```bash
-pytest tests/test_stieltjes.py -v -k forward
+pytest tests/ -v -k forward
 ```
 
 ### Run only the backward tests
 
 ```bash
-pytest tests/test_stieltjes.py -v -k backward
+pytest tests/ -v -k backward
 ```
 
 ### Run a single configuration
 
 ```bash
 # any matching id substring works
-pytest tests/test_stieltjes.py -v -k "backward and 1024"
-pytest tests/test_stieltjes.py -v -k "1-2-512-64-True-1.0"
+pytest tests/ -v -k "backward and 1024"
+pytest tests/ -v -k "1-2-512-64-True-1.0"
 ```
 
 ### Stop on the first failure
 
 ```bash
-pytest tests/test_stieltjes.py -x
+pytest tests/ -x
 ```
 
 ### Stand-alone (no pytest required)
 
+The kernel test file also runs without pytest:
+
 ```bash
-python tests/test_stieltjes.py
+python tests/test_kernel.py
 ```
 
 This walks the same forward and backward grid and prints `PASS`/`FAIL`
 per configuration. Exit code is `0` on success, `1` if any case failed.
-Useful when running on a freshly-spawned compute node where you would
-rather not install `pytest`.
+Useful when running on a freshly-spawned compute node where pytest
+isn't installed.
 
 ### What the suite checks
 
@@ -447,6 +625,23 @@ rather not install `pytest`.
   `max(dQ_err, dK_err, dV_err) < 0.15`. (Backward is currently routed
   through the same reference path under PyTorch autograd, so this test
   is also a regression check on the reference's own gradient.)
+
+---
+
+## Continuous integration
+
+`.github/workflows/tests.yml` runs the CPU subset (imports, data, model)
+on every push and pull request against `main`, across Python 3.10 / 3.11 /
+3.12 on `ubuntu-latest`. The CUDA-only `test_kernel.py` cases auto-skip
+on the GitHub-hosted runners via the module-level `pytestmark`.
+
+The workflow is one job; it installs the CPU PyTorch wheel (no CUDA bits)
+and the package with `--no-deps` so dependency resolution is deterministic
+and fast.
+
+To run the GPU portion in CI you need a self-hosted runner with CUDA. The
+existing CPU job is the canonical CI signal; the GPU portion is exercised
+locally on the paper's H100/A100 hosts before each release.
 
 ---
 

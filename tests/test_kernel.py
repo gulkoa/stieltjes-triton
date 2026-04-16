@@ -1,28 +1,24 @@
 """
-Correctness tests for Stieltjes flash attention.
+Triton kernel correctness tests.
 
-Forward: Triton kernel vs PyTorch reference.
-Backward: torch.autograd.grad through `stieltjes_attention` vs the same through
-the reference impl.
+Forward: Triton kernel vs PyTorch reference (fp16 vs fp32).
+Backward: torch.autograd.grad through `stieltjes_attention` vs the same
+through the reference impl.
 
-Requires a CUDA device with a working Triton install.
+Requires a CUDA device with a working Triton install. All tests in this
+file auto-skip on CPU-only runners via the module-level `pytestmark`
+below.
 
 Run:
-    pytest tests/test_stieltjes.py -v
-or:
-    python tests/test_stieltjes.py
+    pytest tests/test_kernel.py -v
+or, stand-alone:
+    python tests/test_kernel.py
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 import torch
-
-# Allow `python tests/test_stieltjes.py` from the repo root.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from stieltjes_attention import stieltjes_attention, stieltjes_attention_ref
 
