@@ -81,6 +81,40 @@ def test_forward_matches_reference(B, H, N, D, causal, sq):
     assert max_err < 0.05, f"max_err={max_err} too large for B={B} H={H} N={N} D={D} causal={causal} q={sq}"
 
 
+@pytest.mark.parametrize("causal", [False, True])
+def test_noncontiguous_fused_qkv_views(causal):
+    """Regression test for the H_eff stride bug: fused-qkv split+transpose
+    views (the nanoGPT layout) at B > 1 must match the contiguous path
+    exactly. Pre-fix, the kernel derived the head count from strides
+    (stride_qz // stride_qh), which collapses the batch offset to 0 for
+    these views — every batch row >= 1 silently read batch 0's K
+    projection (correct at B = 1 only)."""
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    B, H, N, D = 3, 4, 256, 64
+    C = H * D
+    sm_scale = 1.0 / (D ** 0.5)
+
+    qkv = torch.randn(B, N, 3 * C, device=device, dtype=torch.float16)
+    qv, kv, vv = qkv.split(C, dim=2)
+    q_nc = qv.view(B, N, H, D).transpose(1, 2)   # non-contiguous views
+    k_nc = kv.view(B, N, H, D).transpose(1, 2)
+    v_nc = vv.view(B, N, H, D).transpose(1, 2)
+
+    o_nc = stieltjes_attention(
+        q_nc, k_nc, v_nc, causal=causal, sm_scale=sm_scale,
+        stieltjes_q=1.0, num_iter=5,
+    )
+    o_c = stieltjes_attention(
+        q_nc.contiguous(), k_nc.contiguous(), v_nc.contiguous(),
+        causal=causal, sm_scale=sm_scale, stieltjes_q=1.0, num_iter=5,
+    )
+    max_err = (o_nc - o_c).abs().max().item()
+    assert max_err < 1e-4, (
+        f"non-contiguous views diverge from contiguous path: {max_err}"
+    )
+
+
 @pytest.mark.parametrize("B,H,N,D,causal,sq", BWD_CONFIGS)
 def test_backward_matches_reference(B, H, N, D, causal, sq):
     """Gradients from `stieltjes_attention` should match the reference's autograd."""

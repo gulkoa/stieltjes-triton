@@ -82,10 +82,13 @@ class CausalSelfAttention(nn.Module):
         qkv = self.c_attn(x)  # (B, T, 3*C)
         q, k, v = qkv.split(self.n_embd, dim=2)  # each (B, T, C)
 
-        # Reshape to (B, n_head, T, head_dim)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, H, T, D)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        # Reshape to (B, n_head, T, head_dim). .contiguous() matters: these
+        # are views into the fused qkv buffer, and passing them non-contiguous
+        # into the Triton kernel mis-addressed batches >= 1 before the
+        # explicit-H fix (defense in depth — the kernel is fixed too).
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2).contiguous()  # (B, H, T, D)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2).contiguous()
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2).contiguous()
 
         sm_scale = 1.0 / math.sqrt(self.head_dim)
 

@@ -127,6 +127,7 @@ def _stieltjes_attn_fwd(
     stride_oz, stride_oh, stride_om, stride_ok,
     sm_scale,
     N_CTX,
+    H,                       # true number of heads (see off_z/off_h below)
     sq: tl.constexpr,
     NUM_ITER: tl.constexpr,
     EPS: tl.constexpr,
@@ -138,11 +139,13 @@ def _stieltjes_attn_fwd(
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
 
-    # Recover (batch, head) from the flat (B*H) program id, supporting strided
-    # / non-contiguous Q,K,V.  For contiguous (B,H,N,D), H_eff equals H.
-    H_eff = stride_qz // stride_qh
-    off_z = off_hz // H_eff
-    off_h = off_hz % H_eff
+    # Recover (batch, head) from the flat (B*H) program id. H must be passed
+    # explicitly: deriving it as stride_qz // stride_qh is only valid for
+    # contiguous (B,H,N,D) tensors — for fused-qkv split+transpose views
+    # (stride_qz = 3*T*H*D) it collapses off_z to 0 and every batch row >= 1
+    # silently reads batch 0's K projection.
+    off_z = off_hz // H
+    off_h = off_hz % H
 
     q_offset = off_z * stride_qz + off_h * stride_qh
     k_offset = off_z * stride_kz + off_h * stride_kh
@@ -275,6 +278,7 @@ def _triton_forward(
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         sm_scale,
         N,
+        H,
         sq=stieltjes_q,
         NUM_ITER=num_iter,
         EPS=1e-6,
